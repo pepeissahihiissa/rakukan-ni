@@ -1,0 +1,35 @@
+# rakukan キーバインド設定
+# 入力モード変更時に再読込されます
+
+preset = "ms-ime-us"
+inherit_preset = true
+
+# 追加・上書きしたいバインドだけを書いてください。
+# 例:
+# [[bindings]]
+# key = "Ctrl+;"
+# action = "ime_toggle"
+
+[[bindings]]
+key    = "Henkan"
+action = "convert"
+
+[[bindings]]
+key    = "Muhenkan"
+action = "cycle_kana"
+
+[[bindings]]
+key    = "Zenkaku"
+action = "ime_toggle"
+
+[[bindings]]
+key    = "Hiragana_key"
+action = "mode_hiragana"
+
+[[bindings]]
+key    = "Katakana"
+action = "mode_katakana"
+
+[[bindings]]
+key    = "Eisuu"
+action = "mode_alphanumeric"

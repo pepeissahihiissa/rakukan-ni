@@ -1,0 +1,555 @@
+//! Backend interface for kanji conversion using llama.cpp
+
+use super::error::KanjiError;
+use super::hf_download::{get_tokenizer_path, get_variant_path};
+use super::llamacpp::LlamaCppModel;
+use super::model_config::{ModelFamily, VariantConfig, registry};
+use super::{CONTEXT_TOKEN, INPUT_START_TOKEN, OUTPUT_START_TOKEN};
+use crate::kana::hiragana_to_katakana;
+
+type Result<T> = super::error::Result<T>;
+
+/// Configuration for kanji conversion
+#[derive(Debug, Clone)]
+pub struct ConversionConfig {
+    /// Maximum number of new tokens to generate
+    pub max_new_tokens: usize,
+    /// Space 変換時のビーム幅の**上限**（num_candidates と併せて min をとる）。
+    /// デフォルト 30 では実質無制限で、num_candidates がそのまま beam 幅になる。
+    /// 変換速度を抑えたいユーザは小さく設定する（例: 3）。ランタイムで [1, 30]。
+    pub beam_size: usize,
+    /// 異常変換の棄却に使う「最良候補からの平均 log-prob 差」の許容幅 (nats/token)。
+    /// beam 候補は長さ正規化した平均 log-prob (1 トークンあたりの自信度) で評価し、
+    /// 最良候補より `margin` 以上低い候補は外れ値として捨てる。`None` で無効。
+    /// 既定 3.0 は寛容（最良候補比で 1 トークンあたり e^3≈20 倍も不確かな候補だけを
+    /// 落とす）で、通常の代替候補には影響しない。値を小さくすると棄却が強まる。
+    pub confidence_margin: Option<f32>,
+    /// 最良候補の平均 log-prob (nats/token) の絶対下限。最良候補すらこれを下回る変換は
+    /// 幻覚の可能性が高いため全候補を捨て、かな（元の読み）にフォールバックする。
+    /// 適切な閾値は実地のスコア分布に依存するため既定 `None`（無効）。有効化する場合は
+    /// まず `confidence_margin` のデバッグログで実際の平均 log-prob を観測してから設定する。
+    pub min_top_confidence: Option<f32>,
+    /// If true, skip trim_output_repetition and output length guards (diagnostics).
+    pub no_trim: bool,
+}
+
+impl Default for ConversionConfig {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: 15,
+            beam_size: 30,
+            confidence_margin: Some(3.0),
+            min_top_confidence: None,
+            no_trim: false,
+        }
+    }
+}
+
+fn generation_budget(reading: &str, config_max_new_tokens: usize) -> usize {
+    let reading_chars = reading.chars().count();
+    // 長めの文でも途中で切れにくいよう、固定値ではなく読み長に応じて伸ばす。
+    // jinen 系では 1 文字あたり 1 token 未満になることもあるが、かなり長い文では
+    // 15 token では不足しやすいため、余裕を持って 2 倍 + 8 を上限付きで使う。
+    // M1.5 T-BUG1 (a): 上限を 128 → 256 に引き上げ。20 文字超の長文 reading で
+    // budget が頭打ちになる前に EOS が出るパターン (尻切れ) を抑制する。
+    // KV cache は変換時のみ確保するためメモリ圧は無視できる。
+    config_max_new_tokens
+        .max(reading_chars.saturating_mul(2).saturating_add(8))
+        .min(256)
+}
+
+/// beam の累積 log-prob (score) を「1 トークンあたりの平均 log-prob」に正規化する。
+///
+/// `score` は生成トークンの log-softmax の総和 (≤ 0) で、系列が長いほど負に大きくなる
+/// 長さ依存量。トークン数で割ることで候補間で比較可能な「自信度」になる。
+fn avg_logprob(score: f32, n_tokens: usize) -> f32 {
+    score / (n_tokens.max(1) as f32)
+}
+
+/// 自信度 (平均 log-prob) に基づいて異常変換候補を棄却する。
+///
+/// 入力 `cands` は `(表層, 平均 log-prob)` のリスト（スコア降順を想定）。
+/// - `margin`: 最良候補よりこれ以上低い候補を外れ値として捨てる (相対棄却)。
+/// - `min_top`: 最良候補すらこれを下回るなら全候補を捨て、空を返す (絶対フロア／フォールバック)。
+///
+/// 純粋関数。llama 非依存で単体テスト可能。
+fn filter_by_confidence(
+    cands: Vec<(String, f32)>,
+    margin: Option<f32>,
+    min_top: Option<f32>,
+) -> Vec<String> {
+    if cands.is_empty() {
+        return Vec::new();
+    }
+    // 最良 (= 平均 log-prob 最大) を基準にする。入力はスコア降順想定だが念のため算出。
+    let top = cands
+        .iter()
+        .map(|(_, lp)| *lp)
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    // 絶対フロア: 最良候補すら自信が低すぎる → 全棄却してフォールバックさせる。
+    if let Some(floor) = min_top {
+        if top < floor {
+            return Vec::new();
+        }
+    }
+
+    cands
+        .into_iter()
+        .filter(|(_, lp)| match margin {
+            Some(m) => *lp >= top - m,
+            None => true,
+        })
+        .map(|(s, _)| s)
+        .collect()
+}
+
+/// Build a prompt in jinen format.
+/// `instr` is an optional instruction string injected between context and input.
+pub fn build_jinen_prompt(katakana: &str, context: &str, instr: &str) -> String {
+    format!(
+        "{}{}{}{}{}{}",
+        CONTEXT_TOKEN, context, instr, INPUT_START_TOKEN, katakana, OUTPUT_START_TOKEN
+    )
+}
+
+/// Clean model output by trimming whitespace and removing spurious furigana.
+///
+/// Special tokens (BOS/EOS) are handled at the decode level via
+/// `skip_special_tokens` rather than string replacement.
+///
+/// # Furigana removal
+/// LLM が「健診(けんしん)や」のようにルビ形式で読みを付けることがある。
+/// 全角・半角括弧内がひらがな・カタカナのみで構成される場合は除去する。
+/// 意図的な括弧（(笑)、(注)、(英数字)）はカナ以外の文字を含むため保持される。
+pub fn clean_model_output(text: &str) -> String {
+    strip_furigana(text.trim())
+}
+
+/// Trim repeated suffix segments from model output until it fits reading length.
+pub(crate) fn trim_output_repetition(reading_chars: usize, output: &str) -> String {
+    let mut result = output.to_string();
+    loop {
+        let o: Vec<char> = result.chars().collect();
+        if o.len() <= reading_chars {
+            return result;
+        }
+        let mut trimmed = false;
+        for seg_len in 1..=o.len() / 2 {
+            let suffix_start = o.len() - seg_len;
+            let prev_start = o.len() - seg_len * 2;
+            if &o[suffix_start..] == &o[prev_start..suffix_start] {
+                result = o[..suffix_start].iter().collect::<String>();
+                trimmed = true;
+                break;
+            }
+        }
+        if !trimmed {
+            return result;
+        }
+    }
+}
+
+/// 括弧内がひらがな・カタカナのみで構成される場合に括弧ごと除去する。
+fn strip_furigana(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let close = match c {
+            '（' => Some('）'),
+            '(' => Some(')'),
+            _ => None,
+        };
+        if let Some(close_ch) = close {
+            // 閉じ括弧を探す（同一行内のみ、最大30文字先まで）
+            let lookahead = chars[i + 1..].iter().take(30);
+            let end_pos = lookahead
+                .enumerate()
+                .find(|&(_, &x)| x == close_ch)
+                .map(|(j, _)| j);
+            if let Some(end) = end_pos {
+                let inner: String = chars[i + 1..i + 1 + end].iter().collect();
+                // 内容がひらがな・カタカナ（長音符含む）のみなら除去
+                let is_kana_only = !inner.is_empty() && inner.chars().all(is_kana_or_prolonged);
+                if is_kana_only {
+                    i = i + 1 + end + 1; // 括弧全体をスキップ
+                    continue;
+                }
+            }
+        }
+        result.push(c);
+        i += 1;
+    }
+    result
+}
+
+/// ひらがな・カタカナ・長音符・中点のいずれかか判定する。
+#[inline]
+fn is_kana_or_prolonged(c: char) -> bool {
+    let n = c as u32;
+    (0x3041..=0x3096).contains(&n)   // ひらがな（ぁ〜ゖ）
+    || (0x30A1..=0x30FC).contains(&n) // カタカナ（ァ〜ー、ー含む）
+    || c == 'ー' || c == '・' || c == 'ｰ'
+}
+
+/// Inference backend configuration (llama.cpp GGUF format with external tokenizer)
+#[derive(Debug, Clone)]
+pub struct Backend {
+    gguf_path: String,
+    tokenizer_json_path: String,
+    /// Display name for the model (variant id for registry models, "custom" for GGUF paths)
+    display_name: String,
+    /// Number of layers to offload to GPU (0 = CPU only, u32::MAX = all layers)
+    pub n_gpu_layers: u32,
+    /// GPU index to use (0 = first GPU, -1 = auto)
+    pub main_gpu: i32,
+}
+
+impl Backend {
+    /// Create a backend from a `(ModelFamily, VariantConfig)` pair.
+    ///
+    /// Downloads the GGUF and the external tokenizer from HuggingFace.
+    pub fn from_variant(family: &ModelFamily, variant: &VariantConfig) -> Result<Self> {
+        let path = get_variant_path(family, variant)?;
+        let tokenizer_path = get_tokenizer_path(family)?;
+        Ok(Backend {
+            gguf_path: path.to_string_lossy().to_string(),
+            tokenizer_json_path: tokenizer_path.to_string_lossy().to_string(),
+            display_name: variant.id.clone(),
+            n_gpu_layers: 0,
+            main_gpu: 0,
+        })
+    }
+
+    /// Set the number of GPU layers to offload. -1 = all layers, 0 = CPU only.
+    pub fn with_n_gpu_layers(mut self, n: u32) -> Self {
+        self.n_gpu_layers = n;
+        self
+    }
+
+    /// Set the GPU index to use (0 = first GPU, -1 = auto).
+    pub fn with_main_gpu(mut self, gpu: i32) -> Self {
+        self.main_gpu = gpu;
+        self
+    }
+
+    /// Create a backend by looking up a variant id in the global registry.
+    ///
+    /// E.g. `Backend::from_variant_id("jinen-v1-xsmall-q5")`
+    pub fn from_variant_id(variant_id: &str) -> Result<Self> {
+        let (family, variant) = registry()
+            .find_variant(variant_id)
+            .ok_or_else(|| KanjiError::UnknownVariant(variant_id.to_string()))?;
+        Self::from_variant(family, variant)
+    }
+}
+
+/// Kanji converter using llama.cpp backend
+pub struct KanaKanjiConverter {
+    model: LlamaCppModel,
+    config: ConversionConfig,
+    display_name: String,
+}
+
+impl KanaKanjiConverter {
+    /// Create a new converter with the specified backend
+    pub fn new(backend: Backend) -> Result<Self> {
+        Self::with_config(backend, ConversionConfig::default())
+    }
+
+    /// Create a new converter with the specified backend and configuration
+    pub fn with_config(backend: Backend, config: ConversionConfig) -> Result<Self> {
+        let model = LlamaCppModel::from_file_with_gpu_layers(
+            &backend.gguf_path,
+            &backend.tokenizer_json_path,
+            backend.n_gpu_layers,
+            backend.main_gpu,
+        )?;
+        eprintln!("RKDLL: build={}", env!("RAKUKAN_ENGINE_BUILD_TIME"));
+        Ok(KanaKanjiConverter {
+            model,
+            config,
+            display_name: backend.display_name,
+        })
+    }
+
+    /// Set the number of threads for inference (0 = default).
+    pub fn set_n_threads(&mut self, n: u32) {
+        self.model.set_n_threads(n);
+    }
+
+    /// Convert hiragana to kanji candidates
+    ///
+    /// # Arguments
+    /// * `reading` - Input reading in hiragana
+    /// * `context` - Left context (previously converted text)
+    /// * `num_candidates` - Number of candidates to generate
+    ///
+    /// # Returns
+    /// Vector of conversion candidates
+    pub fn convert(
+        &self,
+        reading: &str,
+        context: &str,
+        num_candidates: usize,
+    ) -> Result<Vec<String>> {
+        let max_new_tokens = generation_budget(reading, self.config.max_new_tokens);
+
+        // Convert hiragana to katakana (model expects katakana input)
+        let katakana = hiragana_to_katakana(reading);
+
+        // Build prompt in jinen format
+        let prompt = build_jinen_prompt(&katakana, context, "");
+
+        // Tokenize
+        let tokens = self.model.tokenize(&prompt)?;
+        let eos = Some(self.model.eos_token_id().0);
+
+        if num_candidates == 1 {
+            // Single candidate: use greedy decoding (faster)
+            let output_tokens = self.model.generate(&tokens, max_new_tokens, eos)?;
+            let generated = &output_tokens[tokens.len()..];
+            let text = self.model.decode(generated, true)?;
+            let clean = clean_model_output(&text);
+            let clean = if self.config.no_trim {
+                clean
+            } else {
+                trim_output_repetition(reading.chars().count(), &clean)
+            };
+
+            let mut candidates = Vec::with_capacity(1);
+            if !clean.is_empty() {
+                candidates.push(clean);
+            }
+
+            // greedy パスは score を返さないため自信度フィルタは適用できない。
+            // 長さ安全網 (下記) のみが効く。スコアによる異常検出が必要なら
+            // num_candidates >= 2 (beam パス) を使う。
+            let reading_chars = reading.chars().count();
+            if !self.config.no_trim {
+                candidates.retain(|c| c.chars().count() * 3 >= reading_chars);
+            }
+            if candidates.is_empty() {
+                candidates.push(reading.to_string());
+            }
+            return Ok(candidates);
+        }
+
+        // Multiple candidates: use true beam search for better candidate quality.
+        // d1_greedy is faster but generates candidates unrelated to the reading.
+        //
+        // beam_size は num_candidates に等しい（ユーザが要求した候補数がそのまま
+        // beam 幅になる）。`config.beam_size` は安全上限として機能し、デフォルト
+        // 30 で実質上限なし。変換速度を抑えたいユーザは config.toml の
+        // `[conversion] beam_size` を小さく設定して明示的に上限をかける。
+        let configured_cap = self.config.beam_size.clamp(1, 30);
+        let beam_size = num_candidates.min(configured_cap).clamp(1, 30);
+        let results = self
+            .model
+            .generate_beam_search(&tokens, max_new_tokens, eos, beam_size)?;
+
+        // (表層, 平均 log-prob) を保持。beam score は累積 log-prob (長さ依存) なので
+        // トークン数で正規化して候補間で比較可能な自信度にする。
+        let mut scored: Vec<(String, f32)> = Vec::with_capacity(results.len());
+        for (output_tokens, score) in results {
+            let text = self.model.decode(&output_tokens, true)?;
+            let clean = clean_model_output(&text);
+            let clean = if self.config.no_trim {
+                clean
+            } else {
+                trim_output_repetition(reading.chars().count(), &clean)
+            };
+            if clean.is_empty() || scored.iter().any(|(s, _)| s == &clean) {
+                continue;
+            }
+            scored.push((clean, avg_logprob(score, output_tokens.len())));
+        }
+
+        // M1.5 T-BUG1 (c): 出力が極端に短い候補を捨てる安全網。reading の
+        // 33% 以上の長さを持つ候補だけを残す。0.7.0 で TSF 側 (T-BUG2) にも
+        // 同等の防壁があるが、エンジン側で先に弾けば session に短い preview が
+        // 入らず、後段の sanity check や filter に頼らず済む。
+        let reading_chars = reading.chars().count();
+        if !self.config.no_trim {
+            scored.retain(|(c, _)| c.chars().count() * 3 >= reading_chars);
+        }
+
+        // 自信度 (平均 log-prob) の観測ログ。閾値チューニングの材料になる。
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for (c, lp) in &scored {
+                tracing::debug!(reading = %reading, candidate = %c, avg_logprob = lp, "conv candidate confidence");
+            }
+        }
+
+        // 自信度に基づく異常変換の棄却（相対外れ値＋絶対フロア）。
+        let mut candidates = filter_by_confidence(
+            scored,
+            self.config.confidence_margin,
+            self.config.min_top_confidence,
+        );
+
+        // If no candidates, return the original reading
+        if candidates.is_empty() {
+            candidates.push(reading.to_string());
+        }
+
+        Ok(candidates)
+    }
+
+    /// Get a human-readable model name for display
+    pub fn model_display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    /// Count only the input (reading) tokens, excluding context and special tokens
+    pub fn count_input_tokens(&self, reading: &str) -> Result<usize> {
+        let katakana = hiragana_to_katakana(reading);
+        let tokens = self.model.tokenize(&katakana)?;
+        Ok(tokens.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_budget_grows_with_reading_length() {
+        // 短い reading は config_max_new_tokens (15) で頭打ち
+        assert_eq!(generation_budget("かな", 15), 15);
+        // 15 文字 reading: 15*2+8 = 38。M1.5 T-BUG1 (a) で上限 256 に拡張済。
+        assert_eq!(generation_budget("これはながめのへんかんぶんです", 15), 38);
+    }
+
+    #[test]
+    fn avg_logprob_normalizes_by_length() {
+        // 累積 -6.0 を 3 トークンで割れば -2.0/token
+        assert_eq!(avg_logprob(-6.0, 3), -2.0);
+        // 同じ累積でも長い系列ほど 1 トークンあたりは小さく（0 に近く）なる
+        assert!(avg_logprob(-6.0, 6) > avg_logprob(-6.0, 3));
+        // 0 除算ガード
+        assert_eq!(avg_logprob(-6.0, 0), -6.0);
+    }
+
+    #[test]
+    fn confidence_filter_keeps_all_when_disabled() {
+        let cands = vec![("漢字".into(), -0.5), ("感じ".into(), -4.0)];
+        let out = filter_by_confidence(cands, None, None);
+        assert_eq!(out, vec!["漢字".to_string(), "感じ".to_string()]);
+    }
+
+    #[test]
+    fn confidence_filter_drops_relative_outlier() {
+        // 最良 -0.5。margin 3.0 → -3.5 未満を棄却。-4.0 の候補は外れ値として落ちる。
+        let cands = vec![
+            ("漢字".into(), -0.5),
+            ("感じ".into(), -1.0),
+            ("ゴミ".into(), -4.0),
+        ];
+        let out = filter_by_confidence(cands, Some(3.0), None);
+        assert_eq!(out, vec!["漢字".to_string(), "感じ".to_string()]);
+    }
+
+    #[test]
+    fn confidence_filter_keeps_top_under_relative_rule() {
+        // 最良候補は基準そのものなので相対ルールでは決して落ちない。
+        let cands = vec![("唯一".into(), -9.9)];
+        let out = filter_by_confidence(cands, Some(3.0), None);
+        assert_eq!(out, vec!["唯一".to_string()]);
+    }
+
+    #[test]
+    fn confidence_filter_absolute_floor_rejects_all() {
+        // 最良 -5.0 が フロア -3.0 を下回る → 全棄却（呼び出し側でかなフォールバック）。
+        let cands = vec![("幻覚".into(), -5.0), ("別".into(), -6.0)];
+        let out = filter_by_confidence(cands, Some(3.0), Some(-3.0));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn confidence_filter_absolute_floor_passes_when_confident() {
+        // 最良 -1.0 はフロア -3.0 以上なので通過し、相対ルールのみ適用。
+        let cands = vec![("良".into(), -1.0), ("悪".into(), -5.0)];
+        let out = filter_by_confidence(cands, Some(3.0), Some(-3.0));
+        assert_eq!(out, vec!["良".to_string()]);
+    }
+
+    #[test]
+
+    fn test_default_model_conversion() {
+        let backend =
+            Backend::from_variant_id("jinen-v1-small-q5").expect("Failed to load default model");
+        let converter = KanaKanjiConverter::new(backend).expect("Failed to create converter");
+
+        let result = converter.convert("かんじ", "", 1);
+        assert!(result.is_ok(), "Conversion failed: {:?}", result.err());
+
+        let candidates = result.unwrap();
+        assert!(!candidates.is_empty(), "No candidates returned");
+
+        let output = &candidates[0];
+        assert!(
+            !output.contains("ã"),
+            "Output contains mojibake: '{}'",
+            output
+        );
+    }
+
+    #[test]
+    #[ignore = "requires network access to download GGUF model"]
+    fn test_xsmall_special_tokens() {
+        use super::super::hf_download::{get_path_by_id, get_tokenizer_path_by_id};
+        use super::super::{CONTEXT_TOKEN, INPUT_START_TOKEN, OUTPUT_START_TOKEN};
+        let path = get_path_by_id("jinen-v1-xsmall-q5").expect("Failed to download GGUF");
+        let tok_path =
+            get_tokenizer_path_by_id("jinen-v1-xsmall-q5").expect("Failed to download tokenizer");
+        let model = LlamaCppModel::from_file(&path, &tok_path).expect("Failed to load model");
+
+        let prompt = build_jinen_prompt("テスト", "", "");
+        let tokens = model.tokenize(&prompt).expect("Failed to tokenize");
+
+        let mut found_context = false;
+        let mut found_input_start = false;
+        let mut found_output_start = false;
+
+        for token in &tokens {
+            let display = model.decode_token_for_display(*token);
+            if display.contains(CONTEXT_TOKEN) {
+                found_context = true;
+            }
+            if display.contains(INPUT_START_TOKEN) {
+                found_input_start = true;
+            }
+            if display.contains(OUTPUT_START_TOKEN) {
+                found_output_start = true;
+            }
+        }
+
+        assert!(found_context, "CONTEXT token (U+EE02) not found");
+        assert!(found_input_start, "INPUT_START token (U+EE00) not found");
+        assert!(found_output_start, "OUTPUT_START token (U+EE01) not found");
+    }
+
+    #[test]
+
+    fn test_xsmall_conversion() {
+        let backend =
+            Backend::from_variant_id("jinen-v1-xsmall-q5").expect("Failed to download GGUF");
+        let converter = KanaKanjiConverter::new(backend).expect("Failed to create converter");
+
+        let result = converter.convert("かんじ", "", 1);
+        assert!(result.is_ok(), "Conversion failed: {:?}", result.err());
+
+        let candidates = result.unwrap();
+        assert!(!candidates.is_empty(), "No candidates returned");
+
+        let output = &candidates[0];
+        assert!(
+            !output.contains("ã"),
+            "Output contains mojibake (GPT-2 byte encoding leak): '{}'",
+            output
+        );
+    }
+}

@@ -1,0 +1,62 @@
+# rakukan 設定ファイル
+# 入力モード変更時に再読込されます。
+
+[general]
+# ログレベル: error / warn / info / debug / trace
+# debug: 開発中の標準。キー入力ごとの状態変化が見える
+# info:  通常運用。初期化・確定・モード変更のみ
+# trace: 詳細調査時。ループ内・トークン単位まで出力される（低速）
+# 環境変数 RAKUKAN_LOG が設定されている場合はそちらが優先される
+log_level = "info"
+
+# GPU バックエンド: "auto" / "cuda" / "vulkan" / "cpu"
+# "auto"   : インストール済みの DLL から cuda → vulkan → cpu の順で自動選択（デフォルト）
+# "cuda"   : NVIDIA GPU (CUDA) ← RTX シリーズ推奨
+# "vulkan" : Vulkan 対応 GPU (AMD / Intel / NVIDIA)
+# "cpu"    : CPU のみ（GPU なし、VMware 等）
+gpu_backend = "auto"
+
+# GPU に載せるレイヤー数
+# 0 で CPU のみ、未指定で全レイヤーを GPU にオフロード
+# GPU 競合や他アプリの異常終了がある場合は 8 / 16 / 24 など小さめを試す
+n_gpu_layers = 16
+
+# 使用する GPU インデックス（複数 GPU 環境で 2 枚目以降を使う場合に変更）
+main_gpu = 0
+
+# LLM モデル ID
+# jinen-v1-xsmall-q5  : 軽量・推奨（約 30 MB、低スペック PC 向け、デフォルト）
+# jinen-v1-small-q5   : 標準（約 84 MB、通常用途）
+# jinen-v1-xsmall-f16 : 高精度・大容量（約 138 MB、量子化なし FP16）
+# jinen-v1-small-f16  : 高精度・大容量（約 423 MB、量子化なし FP16）
+model_variant = "jinen-v1-xsmall-q5"
+
+[keyboard]
+layout = "jis"
+reload_on_mode_switch = true
+
+[input]
+default_mode = "alphanumeric"
+remember_last_kana_mode = true
+# 数字の入力幅: "halfwidth" = 半角 (012), "fullwidth" = 全角 (０１２)
+digit_width = "halfwidth"
+# 英字の入力幅: "fullwidth" = 全角 (ＡＢＣ), "halfwidth" = 半角 (ABC)
+alpha_width = "fullwidth"
+# 記号の入力幅: "fullwidth" = 全角 (＠＃), "halfwidth" = 半角 (@#)
+# 英字・記号の後に入力した `,` `.` は、これらの幅設定に追従して全角/半角の Western 句読点になる
+symbol_width = "fullwidth"
+
+[live_conversion]
+enabled = false
+debounce_ms = 80
+use_llm = false
+prefer_dictionary_first = true
+# ライブ変換の候補数（beam 幅）: 1 = greedy（高速）, 3 = beam search（高品質、デフォルト）
+beam_size = 3
+
+[diagnostics]
+dump_active_config = false
+warn_on_unknown_key = true
+
+# 旧形式との互換用
+# num_candidates = 9

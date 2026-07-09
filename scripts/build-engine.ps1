@@ -1,0 +1,302 @@
+﻿# ============================================================================
+#  [AI ASSISTANT NOTICE / Claude Code 向け注意]
+# ============================================================================
+#  このスクリプトをユーザーに直接実行させるよう案内しないこと。
+#  正規の入口は以下の cargo make コマンドです:
+#
+#      cargo make build-engine           (通常ビルド)
+#      cargo make build-engine-full      (llama キャッシュも削除するクリーンビルド)
+#
+#  このファイルは Makefile.toml から呼び出される内部実装です。
+#  PS1 を直接叩く手順を提示すると cargo make と二重化してユーザーが混乱します。
+# ============================================================================
+#
+# scripts\build-engine.ps1 - rakukan-engine DLL builder (cpu / vulkan / cuda)
+#
+# Outputs (in $BuildDir\<profile>\):
+#   rakukan_engine_cpu.dll    -- always built
+#   rakukan_engine_vulkan.dll -- if VULKAN_SDK is set
+#   rakukan_engine_cuda.dll   -- if nvcc found
+
+param(
+    [ValidateSet("debug","release")] [string]$Profile  = "release",
+    [string]$BuildDir = "C:\rb",
+    # -FullClean: delete entire build dir incl. llama/CUDA cache (slow; rarely needed)
+    # Default: clean only rakukan-engine rlib/cdylib, keep llama/CUDA cache (fast)
+    [switch]$FullClean
+)
+
+$ErrorActionPreference = "Stop"
+Set-Location (Split-Path $PSScriptRoot)
+
+# --- Log setup ---
+# Standalone: write own transcript. Called from install.ps1: skip (PS 5.1 no nested transcript).
+$LogFile       = $null
+$OwnTranscript = $false
+try { $null = Get-Variable -Name TRANSCRIPT_STARTED -Scope Global -ErrorAction Stop }
+catch {
+    $LogFile       = Join-Path (Get-Location).Path "rakukan_build_engine.log"
+    Start-Transcript -LiteralPath $LogFile -Force | Out-Null
+    $OwnTranscript = $true
+    Write-Host "Log: $LogFile"
+}
+
+# --- Compute all paths BEFORE vcvarsall.bat (vcvarsall may clobber env vars) ---
+$profileDir     = if ($Profile -eq "release") { "release" } else { "debug" }
+$cpuDll         = Join-Path $BuildDir "$profileDir\rakukan_engine.dll"
+$llamaGlob      = Join-Path $BuildDir "$profileDir\build\llama-cpp-sys-2-*"
+$ninjaStamp     = Join-Path $BuildDir "ninja_generator.stamp"
+
+$env:CARGO_TARGET_DIR = $BuildDir
+$null = New-Item -ItemType Directory -Force -Path $BuildDir
+
+# --- Backend change detection (llama-cpp-sys-2 cache wipe on cpu <-> cuda etc.) ---
+# config.toml の gpu_backend を参照して、前回ビルド時のバックエンドと異なれば
+# llama-cpp-sys-2 ビルドキャッシュを削除する。MSB1009 "install.vcxproj not found"
+# などの再現性のない失敗を予防する。
+$roamingBase = $env:APPDATA
+if ([string]::IsNullOrWhiteSpace($roamingBase)) {
+    try { $roamingBase = [Environment]::GetFolderPath('ApplicationData') } catch { $roamingBase = $null }
+}
+$roamingConfig = if ($roamingBase) { Join-Path $roamingBase "rakukan\config.toml" } else { $null }
+$gpuBackend = $null
+if ($roamingConfig -and (Test-Path -LiteralPath $roamingConfig)) {
+    foreach ($line in Get-Content -LiteralPath $roamingConfig -ErrorAction SilentlyContinue) {
+        if ($line -match '^\s*gpu_backend\s*=\s*"([^"]+)"') {
+            $gpuBackend = $Matches[1].ToLower()
+            break
+        }
+    }
+}
+if ($gpuBackend -notin @("cuda","vulkan","cpu")) {
+    if ($gpuBackend -eq "auto") {
+        Write-Host "[engine] gpu_backend = `"auto`" in config.toml -> detect-gpu.ps1 で検出"
+    } else {
+        Write-Host "[engine] gpu_backend not set in config.toml -> detect-gpu.ps1 で検出"
+    }
+    $gpuBackend = "cpu"
+    try {
+        $detected = & "$PSScriptRoot\detect-gpu.ps1" -SaveResult
+        if ($detected -and ($detected.Trim().ToLower() -in @("cuda","vulkan","cpu"))) {
+            $gpuBackend = $detected.Trim().ToLower()
+        }
+    } catch { }
+}
+Write-Host "[engine] Backend stamp: $gpuBackend"
+
+$lastBackendFile = Join-Path $BuildDir "last_gpu_backend.txt"
+$lastBackend = if (Test-Path -LiteralPath $lastBackendFile) {
+    (Get-Content -LiteralPath $lastBackendFile -ErrorAction SilentlyContinue) -replace '\s',''
+} else { "" }
+if ($lastBackend -ne $gpuBackend) {
+    Write-Host "[engine] Backend changed ($lastBackend -> $gpuBackend): clearing llama-cpp-sys-2 cache"
+    Get-Item $llamaGlob -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host "  Removing: $($_.FullName)"
+        Remove-Item $_.FullName -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path $lastBackendFile) | Out-Null
+    $gpuBackend | Set-Content -LiteralPath $lastBackendFile -NoNewline
+} else {
+    Write-Host "[engine] Backend unchanged ($gpuBackend): skipping cache wipe"
+}
+
+# --- Clean ---
+# -FullClean : remove entire C:\rb\release (incl. llama CUDA cache) -- slow
+# Default    : cargo clean -p rakukan-engine only (keep llama cache)  -- fast
+#
+# Normal engine ABI changes only need the fast (default) clean.
+# Use -FullClean only when upgrading llama-cpp-sys-2 or fixing broken cache.
+if ($FullClean) {
+    Write-Host "[engine] FullClean: removing $BuildDir\$profileDir ..."
+    Remove-Item (Join-Path $BuildDir $profileDir) -Recurse -Force -ErrorAction SilentlyContinue
+} else {
+    Write-Host "[engine] Incremental clean: cargo clean -p rakukan-engine rakukan-dict (llama cache preserved)"
+    $prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    & cargo clean -p rakukan-engine 2>&1 | Out-Null
+    & cargo clean -p rakukan-dict   2>&1 | Out-Null
+    $ErrorActionPreference = $prev
+    # Remove rakukan-engine-abi cache dirs directly in both target locations.
+    # cargo clean -p is unreliable when CARGO_TARGET_DIR differs between build steps.
+    foreach ($root in @($BuildDir, "target")) {
+        Get-ChildItem $root -Recurse -Directory -Filter "rakukan_engine_abi-*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+        # Also remove the .d dependency file and .rlib if present
+        Get-ChildItem "$root" -Recurse -Filter "librakukan_engine_abi*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+        Get-ChildItem "$root" -Recurse -Filter "rakukan_engine_abi*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+    }
+    Write-Host "[engine] rakukan-engine-abi cache cleared"
+}
+
+# --- Cargo build helper ---
+function Invoke-CargoBuild {
+    param([string]$Package, [string]$Profile, [string]$Features = "")
+    $argList = @("build", "-p", $Package)
+    if ($Profile -eq "release") { $argList += "--release" }
+    if ($Features)              { $argList += "--features=$Features" }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & cargo @argList 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) {
+            Write-Host $_.Exception.Message
+        } else {
+            Write-Host $_
+        }
+    }
+    $ErrorActionPreference = $prev
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+# --- VS environment helper (sources vcvarsall x64, makes Ninja available) ---
+function Invoke-VsEnv {
+    $vcvars  = $null
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if ($vsPath) { $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat" }
+    }
+    if (-not $vcvars -or -not (Test-Path $vcvars)) {
+        foreach ($r in (Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
+            $c = Join-Path $r.FullName "VC\Auxiliary\Build\vcvarsall.bat"
+            if (Test-Path $c) { $vcvars = $c; break }
+        }
+    }
+    if (-not $vcvars) { Write-Warning "vcvarsall.bat not found"; return $false }
+    Write-Host "  Sourcing VS env: $vcvars"
+    $tmp = [IO.Path]::GetTempFileName()
+    cmd /c "`"$vcvars`" x64 > nul 2>&1 && set" | Out-File $tmp -Encoding ASCII
+    Get-Content $tmp | ForEach-Object {
+        if ($_ -match "^([^=]+)=(.*)$") {
+            [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], "Process")
+        }
+    }
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    return $true
+}
+
+# --- nvcc detection (PATH first, then standard install locations) ---
+$nvcc = Get-Command "nvcc" -ErrorAction SilentlyContinue
+if (-not $nvcc) {
+    $cudaRoot = $env:CUDA_PATH
+    if (-not $cudaRoot) {
+        $cudaRoot = Get-Item "Env:CUDA_PATH_V*" -ErrorAction SilentlyContinue |
+                    Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Value
+    }
+    if (-not $cudaRoot) {
+        $cudaRoot = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if ($cudaRoot -and (Test-Path (Join-Path $cudaRoot "bin\nvcc.exe"))) {
+        $env:PATH = "$cudaRoot\bin;$env:PATH"
+        $nvcc = Get-Command "nvcc" -ErrorAction SilentlyContinue
+        Write-Host "[engine] CUDA found at: $cudaRoot"
+    }
+}
+
+# --- Prepare Ninja environment (used for both Vulkan and CUDA) ---
+# MSBuild 18 parallel builds break ExternalProject step ordering (vulkan-shaders-gen).
+# Ninja handles dependencies correctly. CUDA also works with Ninja + CUDACXX=nvcc.
+$needNinja = ($env:VULKAN_SDK -and (Test-Path $env:VULKAN_SDK)) -or ($null -ne $nvcc)
+if ($needNinja) {
+    Write-Host "[engine] Preparing Ninja environment (Vulkan + CUDA)..."
+    Invoke-VsEnv | Out-Null
+    # Wipe llama-cpp-sys-2 cache when cmake exe path or generator changes
+    $cmakeExe  = (Get-Command "cmake" -ErrorAction SilentlyContinue)
+    $cmakePath = if ($cmakeExe) { $cmakeExe.Source } else { "cmake" }
+    $stampVal  = "Ninja|$cmakePath"
+    $lastStamp = if (Test-Path $ninjaStamp) { (Get-Content $ninjaStamp -Raw).Trim() } else { "" }
+    if ($lastStamp -ne $stampVal) {
+        Write-Host "  Config changed; clearing llama-cpp-sys-2 cache"
+        Write-Host "    was: $lastStamp"
+        Write-Host "    now: $stampVal"
+        Get-Item $llamaGlob -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "    Removing: $($_.FullName)"
+            Remove-Item $_.FullName -Recurse -Force
+        }
+        $null = New-Item -ItemType Directory -Force -Path (Split-Path $ninjaStamp)
+        $stampVal | Set-Content $ninjaStamp -NoNewline
+    } else {
+        Write-Host "  Generator unchanged (Ninja); skipping cache wipe"
+    }
+    $env:CMAKE_GENERATOR = "Ninja"
+}
+if ($nvcc) {
+    $env:CUDACXX   = "nvcc"
+    $env:CUDAFLAGS = "--allow-unsupported-compiler"
+    Write-Host "[engine] CUDA: CUDACXX=nvcc CUDAFLAGS=--allow-unsupported-compiler"
+    # Add CUDA lib path to LIB for cudart.lib / cublas.lib linking
+    $cudaLibPath = $null
+    if ($env:CUDA_PATH -and (Test-Path "$env:CUDA_PATH\lib\x64")) {
+        $cudaLibPath = "$env:CUDA_PATH\lib\x64"
+    } elseif (Test-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA") {
+        $cudaLibPath = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory |
+                       Sort-Object Name -Descending | Select-Object -First 1 |
+                       ForEach-Object { "$($_.FullName)\lib\x64" }
+    }
+    if ($cudaLibPath -and (Test-Path $cudaLibPath)) {
+        $env:LIB = "$cudaLibPath;$env:LIB"
+        Write-Host "[engine] CUDA lib path added to LIB: $cudaLibPath"
+    } else {
+        Write-Warning "[engine] CUDA lib path not found; cudart.lib / cublas.lib may be missing"
+    }
+}
+
+# --- CPU DLL ---
+Write-Host "[engine] Building cpu DLL..."
+Invoke-CargoBuild -Package "rakukan-engine" -Profile $Profile -Features ""
+if (Test-Path $cpuDll) {
+    Copy-Item $cpuDll (Join-Path $BuildDir "$profileDir\rakukan_engine_cpu.dll") -Force
+    Write-Host "[engine] [OK] cpu DLL"
+} else {
+    Write-Warning "[engine] cpu DLL not found after build"
+}
+
+# --- Vulkan DLL ---
+if ($env:VULKAN_SDK -and (Test-Path $env:VULKAN_SDK)) {
+    Write-Host "[engine] Building vulkan DLL..."
+    Invoke-CargoBuild -Package "rakukan-engine" -Profile $Profile -Features "rakukan-engine/vulkan"
+    if (Test-Path $cpuDll) {
+        Copy-Item $cpuDll (Join-Path $BuildDir "$profileDir\rakukan_engine_vulkan.dll") -Force
+        Write-Host "[engine] [OK] vulkan DLL"
+    }
+} else {
+    Write-Host "[engine] [--] VULKAN_SDK not set; skipping vulkan DLL"
+}
+
+# --- CUDA DLL ---
+if ($nvcc) {
+    Write-Host "[engine] Building cuda DLL..."
+    Invoke-CargoBuild -Package "rakukan-engine" -Profile $Profile -Features "rakukan-engine/cuda"
+    if (Test-Path $cpuDll) {
+        Copy-Item $cpuDll (Join-Path $BuildDir "$profileDir\rakukan_engine_cuda.dll") -Force
+        Write-Host "[engine] [OK] cuda DLL"
+    }
+} else {
+    Write-Host "[engine] [--] nvcc not found; skipping cuda DLL"
+}
+
+$env:CMAKE_GENERATOR  = $null
+$env:CARGO_TARGET_DIR = $null
+
+# Clear rakukan-engine-abi compile cache (both target locations).
+if ($FullClean) {
+    Write-Host "[engine] Clearing rakukan-engine-abi cache..."
+    $prev2 = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    foreach ($root in @($BuildDir, "target")) {
+        Get-ChildItem $root -Recurse -Directory -Filter "rakukan_engine_abi-*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+        Get-ChildItem "$root" -Recurse -Filter "librakukan_engine_abi*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+        Get-ChildItem "$root" -Recurse -Filter "rakukan_engine_abi*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+    }
+    $ErrorActionPreference = $prev2
+}
+
+if ($OwnTranscript) {
+    Stop-Transcript | Out-Null
+    Write-Host "[engine] Done. Log: $LogFile"
+} else {
+    Write-Host "[engine] Done."
+}
