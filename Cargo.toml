@@ -18,7 +18,7 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["rakukan Contributors"]
 license = "MIT"
-repository = "https://github.com/YOUR_ACCOUNT/rakukan-ni"
+repository = "https://github.com/pepeissahihiissa/rakukan-ni"
 
 # ワークスペース全体で共有する依存バージョン
 # 各クレートは workspace = true で参照する
